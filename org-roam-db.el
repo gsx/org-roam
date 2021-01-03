@@ -111,7 +111,57 @@ so that multi-directories are updated.")
   :type 'integer
   :group 'org-roam)
 
+(defcustom org-roam-encrypt-db 'dont-encrypt
+  "What method (if any) to use for encrypting the Org-roam database.
+
+`dont-encrypt'
+  Do not use encryption.
+
+`sqlcipher'
+  Use sqlcipher to encrypt the whole database. The sqlcipher binary must be
+  available in `exec-path'."
+  :type '(choice (const :tag "dont-encrypt" dont-encrypt)
+                 (const :tag "sqlcipher" sqlcipher))
+  :group 'org-roam)
+
 ;;;; Core Functions
+
+(defun org-roam-db--new-connection ()
+  "Open a new connection to the database.
+This function takes care of transparently handling encryption if necessary."
+  (let* ((sqlcipher-executable-name "sqlcipher")
+         (emacsql-sqlite3-executable
+          (pcase org-roam-encrypt-db
+            ('dont-encrypt emacsql-sqlite3-executable)
+            ('sqlcipher
+             (or (executable-find sqlcipher-executable-name)
+                 (user-error
+                  "Could not find %s in exec-path. Make it available to Emacs or set \
+`org-roam-encrypt-db' to `nil'"
+                  sqlcipher-executable-name)))
+            (_ (user-error "Invalid `org-roam-encrypt-db': %s"
+                org-roam-encrypt-db))))
+         (conn (emacsql-sqlite3 org-roam-db-location)))
+    (set-process-query-on-exit-flag (emacsql-process conn) nil)
+    (when (eq org-roam-encrypt-db 'sqlcipher)
+      (let
+          ((db-passphrase (read-passwd "Org-roam database passphrase: ")))
+        (unwind-protect
+            (let ((pragma-response
+                   (caar (emacsql conn [:pragma (= key $r1)] db-passphrase))))
+              (unless (eq pragma-response 'ok)
+                (error "Unexpected response to key pragma from sqlcipher: %s"
+                       pragma-response)))
+          (clear-string db-passphrase))
+        (let ((pragma-response
+               (caar (emacsql conn [:pragma cipher_integrity_check]))))
+          (when pragma-response
+            (emacsql-close conn)
+            (user-error
+             "Org-roam database encryption integrity check failed. Do you \
+have the right password? (Failed: %s)"
+             pragma-response)))))
+    conn))
 
 (defun org-roam-db--get-connection ()
   "Return the database connection, if any."
@@ -126,8 +176,7 @@ Performs a database upgrade when required."
                (emacsql-live-p (org-roam-db--get-connection)))
     (let ((init-db (not (file-exists-p org-roam-db-location))))
       (make-directory (file-name-directory org-roam-db-location) t)
-      (let ((conn (emacsql-sqlite3 org-roam-db-location)))
-        (set-process-query-on-exit-flag (emacsql-process conn) nil)
+      (let ((conn (org-roam-db--new-connection)))
         (puthash (expand-file-name org-roam-directory)
                  conn
                  org-roam-db--connection)
