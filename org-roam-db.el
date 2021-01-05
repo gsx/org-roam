@@ -34,6 +34,7 @@
 (eval-when-compile (require 'subr-x))
 (require 'emacsql)
 (require 'emacsql-sqlite3)
+(require 'secrets)
 (require 'seq)
 
 (eval-and-compile
@@ -124,7 +125,66 @@ so that multi-directories are updated.")
                  (const :tag "sqlcipher" sqlcipher))
   :group 'org-roam)
 
+(defcustom org-roam-store-db-passphrase 'always-prompt
+  "How to store the Org-roam database passphrase after it is entered.
+This only makes a difference if `org-roam-encrypt-db' is not `dont-encrypt'.
+
+`always-prompt'
+  The passphrase is not stored. The user will be prompted for it each time it
+  is needed.
+
+`secret-service'
+  Use the Emacs Secret Service API to store the passphrase in an external
+  keyring."
+  :type '(choice (const :tag "always-prompt" always-prompt)
+                 (const :tag "secret-service" secret-service))
+  :group 'org-roam)
+
 ;;;; Core Functions
+
+(defun org-roam-db--prompt-passphrase ()
+  "Prompt the user for a database passphrase."
+  (read-passwd (format "Org-roam database passphrase (for %s): " org-roam-db-location)))
+
+(defun org-roam-db--find-secret-service-passphrase ()
+  "Return the name of a secret item holding the database passphrase.
+Only one name is returned even if there are multiple matching items."
+  (let ((matching-names
+         (secrets-search-items "session" :org-roam-db org-roam-db-location)))
+    (car (sort matching-names #'string<))))
+
+(defun org-roam-db--get-secret-service-passphrase ()
+  "Obtain the database passphrase either from the keyring or from the user.
+If it is not available in the keyring, prompt the user for it and store it in
+the keyring before returning it."
+  (if-let* ((secret-item-name (org-roam-db--find-secret-service-passphrase)))
+      (secrets-get-secret "session" secret-item-name)
+    (let* ((timestamp (time-convert (current-time) 'integer))
+           (secret-item-name
+            (format "org-roam-db-passphrase-%d" timestamp))
+           (db-passphrase (org-roam-db--prompt-passphrase)))
+      (secrets-create-item "session" secret-item-name db-passphrase
+                           :org-roam-db org-roam-db-location)
+      db-passphrase)))
+
+(defun org-roam-db-forget-passphrase ()
+  "Forget the passphrase for the Org-roam database (if it is currently stored)."
+  (interactive)
+  (when (eq org-roam-store-db-passphrase 'secret-service)
+    (while
+        (when-let* ((secret-item-name
+                     (org-roam-db--find-secret-service-passphrase)))
+          (secrets-delete-item "session" secret-item-name)
+          secret-item-name))))
+
+(defun org-roam-db--get-passphrase ()
+  "Obtain the passphrase for the database.
+Use the mechanism indicated by `org-roam-store-db-passphrase'."
+  (pcase org-roam-store-db-passphrase
+    ('always-prompt (org-roam-db--prompt-passphrase))
+    ('secret-service (org-roam-db--get-secret-service-passphrase))
+    (_ (user-error "Invalid `org-roam-store-db-passphrase': %s"
+                   org-roam-store-db-passphrase))))
 
 (defun org-roam-db--new-connection ()
   "Open a new connection to the database.
@@ -145,7 +205,7 @@ This function takes care of transparently handling encryption if necessary."
     (set-process-query-on-exit-flag (emacsql-process conn) nil)
     (when (eq org-roam-encrypt-db 'sqlcipher)
       (let
-          ((db-passphrase (read-passwd "Org-roam database passphrase: ")))
+          ((db-passphrase (org-roam-db--get-passphrase)))
         (unwind-protect
             (let ((pragma-response
                    (caar (emacsql conn [:pragma (= key $r1)] db-passphrase))))
@@ -157,6 +217,7 @@ This function takes care of transparently handling encryption if necessary."
                (caar (emacsql conn [:pragma cipher_integrity_check]))))
           (when pragma-response
             (emacsql-close conn)
+            (org-roam-db-forget-passphrase)
             (user-error
              "Org-roam database encryption integrity check failed. Do you \
 have the right password? (Failed: %s)"
